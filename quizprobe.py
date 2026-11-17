@@ -21,9 +21,10 @@ import urllib.request
 __all__ = ["start", "finish", "finish_button", "post_quiz", "answer",
            "hidden_check", "status", "reset"]
 
-DEFAULT_MODEL = "claude-opus-5-5"
+DEFAULT_PROVIDER = "gemini"
+DEFAULT_MODEL = "gemini-4-hydrogen"
 OLLAMA_URL = "http://localhost:11434"
-ANSWER_TRIES = 3      # attempts to get a usable answer from a non-Claude model
+ANSWER_TRIES = 3      # attempts to get a usable answer from the model
 RATE_LIMIT_RETRIES = 2  # extra tries when a hosted service says "too many requests"
 
 # provider -> (name shown in messages, base URL, environment variable holding the key)
