@@ -1,0 +1,14 @@
+# macOS / Jupyter
+.DS_Store
+.ipynb_checkpoints/
+__pycache__/
+
+# Student data written by quizprobe - never commit
+quizprobe_report.json
+.quizprobe_*.json
+
+# Build output
+dist/
+build/
+*.egg-info/
+.venv/
