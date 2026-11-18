@@ -259,4 +259,369 @@ def _on_cell(result):
     except Exception:  # the coach must never interrupt a quiz
         _internal_errors.append(traceback.format_exc())
 
+def start(quiz_id="quiz", notebook=None, persist=True):
+    """Start recording. Safe to run more than once; it never clears the record.
 
+    quiz_id   names the record file (.quizprobe_<quiz_id>.json), so the record
+              survives a kernel restart. Use a different id for each quiz.
+    notebook  path of the quiz notebook, used to read the question texts. Found
+              automatically in most Jupyter setups.
+    persist   set False to keep the record in memory only.
+    """
+    global _state
+    ip = _ipython()
+    if ip is None:
+        raise RuntimeError("quizprobe.start() must be run inside a Jupyter notebook.")
+    if not _config["active"]:
+        _config.update(quiz_id=re.sub(r"\W+", "_", str(quiz_id)), notebook=notebook, persist=persist)
+        if persist and os.path.exists(_state_path()):
+            with open(_state_path(), encoding="utf-8") as f:
+                _state = {**_new_state(), **json.load(f)}
+            if _state["result"] and "reviews" not in _state["result"]:
+                _state["result"] = None  # made by an older version of quizprobe; review again
+        ip.events.register("post_run_cell", _on_cell)
+        _config["active"] = True
+
+
+def reset():
+    """Erase the record for this quiz (instructor use)."""
+    global _state
+    _state = _new_state()
+    if _config["persist"] and os.path.exists(_state_path()):
+        os.remove(_state_path())
+
+
+def status():
+    """Print what has been recorded so far."""
+    failed = sum(1 for e in _state["events"] if not e["passed"])
+    print(f"Functions tracked: {len(_state['attempts'])}")
+    print(f"Test runs recorded: {len(_state['events'])} ({failed} failed)")
+    print(f"Syntax errors ignored: {_state['syntax_errors']}")
+    if _internal_errors:
+        print(f"Internal coach errors: {len(_internal_errors)} (last one below)")
+        print(_internal_errors[-1])
+
+
+def hidden_check(function_name, cases, time_limit=None, kind="hidden"):
+    """Run tests the student must not see, and record the failures.
+
+    cases       list of (args, expected) pairs; args is a tuple of arguments
+                (a single non-tuple argument is also accepted).
+    time_limit  optional seconds per case; a slower correct answer is recorded
+                as a failure. The call is not interrupted, only timed.
+
+    Prints only how many cases passed. Returns True if all passed.
+    """
+    ip = _ipython()
+    fn = ip.user_ns.get(function_name) if ip is not None else None
+    _capture(function_name)
+    passed = 0
+    for args, expected in cases:
+        if not isinstance(args, tuple):
+            args = (args,)
+        details = {
+            "test": _short(f"{function_name}({', '.join(repr(a) for a in args)})", 800),
+            "expected": _short(expected),
+        }
+        if not callable(fn):
+            details["error"] = f"NameError: {function_name} is not defined"
+        else:
+            began = time.perf_counter()
+            try:
+                returned = fn(*copy.deepcopy(args))
+            except Exception as err:  # the student's code may raise anything
+                details["error"] = _short(f"{type(err).__name__}: {err}")
+            else:
+                elapsed = time.perf_counter() - began
+                if returned != expected:
+                    details["error"] = "Wrong result"
+                    details["returned"] = _short(returned)
+                elif time_limit is not None and elapsed > time_limit:
+                    details["error"] = f"Correct but too slow: {elapsed:.2f}s, limit {time_limit}s"
+        if "error" in details:
+            _add_event(function_name, kind, False, **details)
+        else:
+            passed += 1
+    if passed == len(cases):
+        _add_event(function_name, kind, True, test=f"{len(cases)} case(s)")
+    _save()
+    print(f"{kind.capitalize()} check for {function_name}: {passed} of {len(cases)} passed")
+    return passed == len(cases)
+
+
+# --------------------------------------------------------------------------
+# Building the evidence
+# --------------------------------------------------------------------------
+
+# Finds the function a question asks for, e.g. "Define a function sort_inventory(info)".
+_ASKS_FOR = re.compile(r"\b(?:function|def)\s+`?([A-Za-z_]\w*)`?\s*\(")
+
+
+def _notebook_path():
+    path = _config["notebook"] or os.environ.get("JPY_SESSION_NAME")
+    if not path or not path.endswith(".ipynb"):
+        return None
+    for candidate in (path, os.path.basename(path)):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def _text_cells():
+    """Markdown and raw cells of the quiz notebook: where the questions are written."""
+    path = _notebook_path()
+    if path is None:
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            cells = json.load(f).get("cells", [])
+    except (OSError, ValueError):
+        return []
+    texts = []
+    for cell in cells:
+        if cell.get("cell_type") in ("markdown", "raw"):
+            source = cell.get("source", "")
+            texts.append((source if isinstance(source, str) else "".join(source)).strip())
+    return texts
+
+
+def _first_seq(name):
+    seqs = [v["seq"] for v in _state["attempts"].get(name, [])]
+    seqs += [e["seq"] for e in _state["events"] if e["function"] == name]
+    return min(seqs) if seqs else float("inf")
+
+
+def _plan_review():
+    """Decide which functions are quiz answers to review.
+
+    Returns (functions to review in order, {function: question text}, other
+    functions the student defined, shown to the model as context only).
+    """
+    attempts = _state["attempts"]
+    tested = {e["function"] for e in _state["events"] if e["kind"] != "experiment"}
+    texts = _text_cells()
+    asked_for = {m.group(1) for t in texts for m in _ASKS_FOR.finditer(t)}
+
+    questions = {}
+    for name in set(attempts) | tested | asked_for:
+        pattern = re.compile(rf"\b{re.escape(name)}\s*\(")
+        match = next((t for t in texts if pattern.search(t)), None)
+        if match:
+            questions[name] = match
+
+    # A quiz answer is a function the student wrote that a question asks for,
+    # or any function a test cell called (even one the student never wrote).
+    review = {n for n in attempts if n in asked_for} | tested
+    if not review:  # no question text found and no tests run: review everything
+        review = set(attempts)
+    review = sorted(review, key=_first_seq)
+    others = sorted((n for n in attempts if n not in review), key=_first_seq)
+    return review, questions, others
+
+
+def _format_event(event):
+    lines = [f'<test_run kind="{event["kind"]}" result="{"passed" if event["passed"] else "failed"}" '
+             f'code_version="{event["version"]}">']
+    for key, label in (("test", "test"), ("error", "error"), ("returned", "returned"),
+                       ("expected", "expected"), ("raised_at", "raised at"),
+                       ("passed_before", "earlier asserts in the same cell that passed")):
+        if key in event:
+            lines.append(f"{label}: {event[key]}")
+    lines.append("</test_run>")
+    return "\n".join(lines)
+
+
+def _evidence():
+    """Return (text for the model, list of quiz functions reviewed)."""
+    review, questions, others = _plan_review()
+    events = _state["events"]
+
+    blocks = []
+    for name in review:
+        versions = _state["attempts"].get(name, [])
+        dropped = max(0, len(versions) - MAX_VERSIONS)
+        mine = [e for e in events if e["function"] == name and (dropped == 0 or e["version"] > dropped)]
+        failures = [e for e in mine if not e["passed"]]
+        skipped = max(0, len(failures) - MAX_FAILURES)
+        if skipped:
+            cut = {e["seq"] for e in failures[:skipped]}
+            mine = [e for e in mine if e["seq"] not in cut]
+
+        timeline = []
+        for i, v in enumerate(versions, 1):
+            if i > dropped:
+                final = ' final="true"' if i == len(versions) else ""
+                timeline.append((v["seq"], f'<code version="{i}"{final}>\n{v["code"]}\n</code>'))
+        timeline += [(e["seq"], _format_event(e)) for e in mine]
+        timeline.sort()
+
+        status = []
+        for kind in ("precheck", "check", "hidden"):
+            last = next((e for e in reversed(events) if e["function"] == name and e["kind"] == kind), None)
+            if last is not None:
+                note = "" if last["version"] == len(versions) else " (final code version was not re-tested)"
+                status.append(f'{kind}: {"passed" if last["passed"] else "failed"}{note}')
+
+        block = [f'<question function="{name}">']
+        if name in questions:
+            block.append(f"<question_text>\n{questions[name]}\n</question_text>")
+        else:
+            block.append("(No question text was found for this function.)")
+        if not versions:
+            block.append("The student never defined a function with this name.")
+        if dropped:
+            block.append(f"({dropped} earlier code version(s) and their test runs are not shown.)")
+        if skipped:
+            block.append(f"({skipped} earlier failed test run(s) are not shown.)")
+        block.append("<timeline>")
+        block.extend(text for _, text in timeline)
+        block.append("</timeline>")
+        block.append(f"<final_status>{'; '.join(status) or 'no test cell was run'}</final_status>")
+        block.append("</question>")
+        blocks.append("\n".join(block))
+
+    if others:
+        extra = ["<other_code>",
+                 "Other functions the student defined (helpers or scratch work; final versions):"]
+        extra += [_state["attempts"][n][-1]["code"] for n in others]
+        extra.append("</other_code>")
+        blocks.append("\n".join(extra))
+    return "\n\n".join(blocks), review
+
+
+# --------------------------------------------------------------------------
+# Asking the model
+# --------------------------------------------------------------------------
+
+_SYSTEM = """\
+You are helping a university instructor who runs introductory Python coding \
+quizzes in Jupyter notebooks. Each quiz question asks the student to write one \
+function. Students check their work against visible tests (a precheck that \
+costs no marks, and a graded check), and the instructor also runs hidden tests \
+the student never sees, which often probe edge cases or efficiency. A student \
+has just finished an attempt. For each question you get the question text, \
+every version of the student's code in order (the one marked final is their \
+answer), and the test runs, with what their function returned.
+
+The student reads your answer straight away, so write to them directly \
+("you"), plainly, and without jargon they have not met.
+
+Part 1: review each question. Read the question text and the student's code \
+yourself instead of relying on the tests alone: code can pass every test it \
+was run against and still be wrong, and a test can fail for a reason that is \
+not a misunderstanding. Give every question one verdict:
+- correct: the final code does what the question asks.
+- unfinished: the final code is a stub or clearly incomplete.
+- slip: the final code is wrong only through a typo, a misnamed function or \
+variable, a syntax problem, or a similar accident.
+- misconception: the code shows a wrong belief about how Python or the problem \
+works.
+A misconception is a belief that would make the student fail again on a \
+different question: for example, that a string method changes the string in \
+place, that "12" and 12 compare as equal, or that sorting strings of digits \
+puts "10" after "9". Name one only when you can point to the code that shows \
+it and say what input makes it go wrong. Slips, unfinished work, style \
+preferences and code that is merely longer than needed are not \
+misconceptions; slowness counts only when it comes from a wrong belief, such \
+as thinking `x in some_list` is as fast as `x in some_set`. A mistake the \
+student later fixed still counts when it shows a wrong belief, because one \
+fix may have been trial and error; in that case the verdict can be correct \
+while the misconception is still listed. Failed test runs are evidence even \
+when the code that produced them is not shown (code_version 0): what the \
+function returned tells you what that code did. If the same belief shows up in \
+several questions, list it once with all of them. If nothing shows a \
+misconception, return empty lists: an honest "nothing to practise" is better \
+than an invented one, because the student will spend time on whatever you name.
+
+Part 2: write one multiple-choice question for each misconception, set in a \
+fresh context so the student cannot answer by recalling their quiz code. \
+Prefer kind "output": a short, self-contained snippet of at most 12 lines with \
+the stem "What does this code print?". Its options are exact printed outputs. \
+The correct option must be exactly what the snippet prints, character for \
+character, and each wrong option should be what a student holding the \
+misconception, or a closely related wrong belief, would expect to see. Every \
+snippet is run before the student sees it and a question whose marked answer \
+does not match the real output is thrown away, so trace the code carefully. \
+If the code raises an error, the correct option must name the exception, for \
+example "TypeError". Use kind "concept", with the code left empty or shown \
+for reading only, only when the misconception cannot be shown through printed \
+output.
+Rules for every question:
+- Exactly 4 options, exactly one of them correct.
+- For each option, `why` gives one or two sentences: for the correct one, why \
+it is right; for a wrong one, the belief that leads to it and what actually \
+happens.
+- Snippets use only the Python standard library and print the same output on \
+every run: no printing of unordered sets of strings, ids, random numbers, the \
+clock, files, input() or network.
+- When spaces or quotes are what the question is about, print with repr() so \
+the student can see them.
+- Do not quote the inputs of hidden tests; describe the kind of case instead.
+- quiz_function is the quiz function whose review led to the question."""
+
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string", "description": "One or two sentences to the student."},
+        "reviews": {
+            "type": "array",
+            "description": "One entry per quiz question, in the order given.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string"},
+                    "verdict": {"type": "string",
+                                "enum": ["correct", "unfinished", "slip", "misconception"]},
+                    "comment": {"type": "string", "description": "One or two sentences to the student."},
+                },
+                "required": ["function", "verdict", "comment"],
+                "additionalProperties": False,
+            },
+        },
+        "misconceptions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "M1, M2, ..."},
+                    "name": {"type": "string", "description": "Short plain-language name."},
+                    "what_happened": {"type": "string", "description": "The evidence, told to the student."},
+                    "explanation": {"type": "string", "description": "How it actually works, 2-4 sentences."},
+                    "quiz_functions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["id", "name", "what_happened", "explanation", "quiz_functions"],
+                "additionalProperties": False,
+            },
+        },
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "misconception_id": {"type": "string"},
+                    "quiz_function": {"type": "string"},
+                    "kind": {"type": "string", "enum": ["output", "concept"]},
+                    "stem": {"type": "string"},
+                    "code": {"type": "string", "description": "Python snippet, or empty."},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "correct": {"type": "boolean"},
+                                "why": {"type": "string"},
+                            },
+                            "required": ["text", "correct", "why"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["misconception_id", "quiz_function", "kind", "stem", "code", "options"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["summary", "reviews", "misconceptions", "questions"],
+    "additionalProperties": False,
+}
