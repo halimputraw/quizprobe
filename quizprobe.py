@@ -625,3 +625,217 @@ _SCHEMA = {
     "required": ["summary", "reviews", "misconceptions", "questions"],
     "additionalProperties": False,
 }
+def _shape_problem(value, schema, where="answer"):
+    """Return how a model's answer departs from the schema, or None if it fits."""
+    kind = schema.get("type")
+    if kind == "object":
+        if not isinstance(value, dict):
+            return f"{where} must be an object"
+        for key in schema.get("required", []):
+            if key not in value:
+                return f"{where} is missing '{key}'"
+        for key, sub in schema.get("properties", {}).items():
+            if key in value:
+                problem = _shape_problem(value[key], sub, f"{where}.{key}")
+                if problem:
+                    return problem
+    elif kind == "array":
+        if not isinstance(value, list):
+            return f"{where} must be a list"
+        for i, item in enumerate(value):
+            problem = _shape_problem(item, schema["items"], f"{where}[{i}]")
+            if problem:
+                return problem
+    elif kind == "string" and not isinstance(value, str):
+        return f"{where} must be text"
+    elif kind == "boolean" and not isinstance(value, bool):
+        return f"{where} must be true or false"
+    if "enum" in schema and value not in schema["enum"]:
+        return f"{where} must be one of: {', '.join(schema['enum'])}"
+    return None
+
+
+def _ssl_context():
+    """Use certifi's root certificates when installed.
+
+    Python from python.org on macOS ships without root certificates, so HTTPS
+    calls fail there unless certifi supplies them. Verification is never turned off.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return None
+    return ssl.create_default_context(cafile=certifi.where())
+
+
+def _post_json(url, body, headers=None, service="Ollama", timeout=900, retries=None, max_wait=60):
+    data = json.dumps(body).encode("utf-8")
+    all_headers = {"Content-Type": "application/json", "User-Agent": "quizprobe/1.0"}
+    all_headers.update(headers or {})
+    retries = RATE_LIMIT_RETRIES if retries is None else retries
+    for attempt in range(retries + 1):
+        request = urllib.request.Request(url, data=data, headers=all_headers)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(detail)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list) and parsed:
+                parsed = parsed[0]
+            if isinstance(parsed, dict) and "error" in parsed:
+                inner = parsed["error"]
+                detail = str(inner.get("message", inner)) if isinstance(inner, dict) else str(inner)
+            detail = _short(detail, 300)
+            busy = err.code in (500, 502, 503, 504, 529)  # temporary overload on the server's side
+            if (err.code == 429 or busy) and attempt < retries:
+                wait = err.headers.get("Retry-After") or ""
+                time.sleep(min(float(wait) if wait.replace(".", "", 1).isdigit() else 20, max_wait))
+                continue
+            if busy:
+                raise CoachError(f"{service} is overloaded right now ({detail}). Wait a minute, "
+                                 "then run this cell again.", err.code) from None
+            if err.code == 429:
+                raise CoachError(f"{service}'s rate limit was reached. Wait a minute, "
+                                 "then run this cell again.", 429) from None
+            if err.code in (401, 403):
+                raise CoachError(f"{service} rejected the API key ({detail}).", err.code) from None
+            if err.code == 404:
+                raise CoachError(f"{service} could not find the model or address ({detail}).", 404) from None
+            raise CoachError(f"{service} returned an error ({err.code}): {detail}", err.code) from None
+        except (urllib.error.URLError, OSError) as err:
+            reason = str(getattr(err, "reason", err))
+            if "CERTIFICATE_VERIFY_FAILED" in reason:
+                reason += ". This Python has no root certificates; run: pip install certifi"
+            raise CoachError(f"Could not reach {service} at {url} ({reason}).") from None
+
+
+def _plain_messages(user_message):
+    """Messages for models without built-in schema enforcement: the schema goes in the prompt."""
+    system = (_SYSTEM + "\n\nAnswer with one JSON object that follows this JSON schema, "
+              "and nothing else:\n" + json.dumps(_SCHEMA))
+    return [{"role": "system", "content": system}, {"role": "user", "content": user_message}]
+
+
+def _until_valid(messages, send, label):
+    """Call send(messages) -> (text, cut_off) until the answer fits the schema."""
+    problem = None
+    for _ in range(ANSWER_TRIES):
+        text, cut_off = send(messages)
+        if cut_off:
+            problem = "it was cut off before it finished"
+        else:
+            try:
+                result = json.loads(_strip_fence(text))
+            except ValueError:
+                problem = "it was not valid JSON"
+            else:
+                problem = _shape_problem(result, _SCHEMA)
+                if problem is None:
+                    return result
+        messages += [{"role": "assistant", "content": text},
+                     {"role": "user", "content": f"That answer cannot be used: {problem}. "
+                                                 "Send the complete corrected JSON object only."}]
+    raise CoachError(f"The model '{label}' did not give a usable answer in "
+                     f"{ANSWER_TRIES} tries (last problem: {problem}).")
+
+
+def _ask_ollama(user_message, model, base_url=None, options=None):
+    url = (base_url or OLLAMA_URL).rstrip("/") + "/api/chat"
+    messages = _plain_messages(user_message)
+    # Ollama silently cuts off a prompt that is longer than its context window,
+    # so ask for a window big enough for the whole record plus the answer.
+    settings = {"temperature": 0.2,
+                "num_ctx": max(8192, sum(len(m["content"]) for m in messages) // 3 + 6000)}
+    settings.update(options or {})
+
+    def send(messages):
+        try:
+            reply = _post_json(url, {"model": model, "messages": messages, "stream": False,
+                                     "format": _SCHEMA, "options": settings})
+        except CoachError as err:
+            hint = {404: f" Run: ollama pull {model}", None: " Is Ollama running?"}.get(err.status, "")
+            raise CoachError(str(err) + hint, err.status) from None
+        text = (reply.get("message") or {}).get("content") or ""
+        return text, reply.get("done_reason") == "length"
+
+    return _until_valid(messages, send, model)
+
+
+def _find_key(name):
+    """Return the API key called `name`, or None.
+
+    Looks in the environment first. Jupyter started from an app icon, or from a
+    terminal opened before the key was saved, does not inherit variables set in
+    the shell profile, so the profile files are read as a fallback.
+    """
+    value = os.environ.get(name)
+    if value:
+        return value
+    pattern = re.compile(rf"^\s*(?:export\s+)?{re.escape(name)}=(.*)$")
+    for profile in (".zshrc", ".zprofile", ".zshenv", ".bash_profile", ".bashrc", ".profile"):
+        try:
+            with open(os.path.join(os.path.expanduser("~"), profile), encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line in reversed(lines):
+            match = pattern.match(line)
+            if match:
+                value = match.group(1).strip().strip("\"'")
+                if value and "$" not in value:
+                    return value
+    return None
+
+
+def _ask_compatible(user_message, provider, model, base_url=None, api_key_env=None):
+    """Ask any hosted service that speaks the OpenAI chat-completions format.
+
+    model may be one name or a list of names to try in order. The next one is
+    used when a model is overloaded, rate limited, unavailable, too slow, or
+    gives unusable answers. Returns (result, name of the model that answered,
+    list of skipped models with the reason for each).
+    """
+    service, default_url, default_env = _PRESETS[provider]
+    env = api_key_env or default_env
+    key = _find_key(env)
+    if not key:
+        raise CoachError(f"No API key was found. Set the {env} environment variable on the "
+                         "machine that runs the notebook kernel, or add the line "
+                         f'export {env}="..." to ~/.zshrc.')
+    url = (base_url or default_url).rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {key}"}
+    models = [model] if isinstance(model, str) else list(model)
+    skipped = []
+
+    for position, name in enumerate(models):
+        is_last = position == len(models) - 1
+        # A model with a backup behind it gets one short second chance; the
+        # last model gets the full wait-and-retry treatment.
+        limits = {} if is_last else {"retries": 1, "max_wait": 8}
+        extra = {"response_format": {"type": "json_object"}}
+
+        def send(messages):
+            def post(body):
+                return _post_json(url, body, headers, service, timeout=180, **limits)
+            try:
+                reply = post({"model": name, "messages": messages, **extra})
+            except CoachError as err:
+                if err.status != 400 or not extra:
+                    raise
+                extra.clear()  # this service or model has no JSON mode; rely on the instructions
+                reply = post({"model": name, "messages": messages})
+            choice = (reply.get("choices") or [{}])[0]
+            return ((choice.get("message") or {}).get("content") or "",
+                    choice.get("finish_reason") == "length")
+
+        try:
+            return _until_valid(_plain_messages(user_message), send, name), name, skipped
+        except CoachError as err:
+            # A bad request or a rejected key will fail on every model, so stop there.
+            if is_last or err.status in (400, 401, 403):
+                raise
+            skipped.append({"model": name, "reason": str(err)})
