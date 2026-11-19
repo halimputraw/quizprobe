@@ -839,3 +839,308 @@ def _ask_compatible(user_message, provider, model, base_url=None, api_key_env=No
             if is_last or err.status in (400, 401, 403):
                 raise
             skipped.append({"model": name, "reason": str(err)})
+def _strip_fence(code):
+    """Local models often wrap code in ``` fences; remove them."""
+    match = re.fullmatch(r"\s*```[\w+-]*\n(.*?)\n?```\s*", code, re.S)
+    return match.group(1) if match else code
+
+
+# --------------------------------------------------------------------------
+# Checking the generated questions before the student sees them
+# --------------------------------------------------------------------------
+
+def _unsafe_reason(code):
+    """Return why generated code must not be run, or None if it looks harmless."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as err:
+        return f"does not parse: {err.msg}"
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+        else:
+            modules = []
+        for module in modules:
+            if module.split(".")[0] not in _ALLOWED_IMPORTS:
+                return f"imports {module}"
+        if isinstance(node, ast.Name) and (node.id in _BANNED_NAMES or "__" in node.id):
+            return f"uses {node.id}"
+        if isinstance(node, ast.Attribute) and "__" in node.attr:
+            return f"uses {node.attr}"
+    return None
+
+
+def _normalise(text):
+    """Compare printed output: ignore trailing spaces, blank edge lines and wrapping backticks.
+
+    Leading spaces are kept, because " 8" and "8" are different answers.
+    """
+    text = text.strip("\n")
+    if len(text) > 1 and text.startswith("`") and text.endswith("`"):
+        text = text.strip("`")
+    return "\n".join(line.rstrip() for line in text.splitlines()).strip("\n")
+
+
+def _run_snippet(code):
+    """Run a snippet twice with different hash seeds, in a separate Python.
+
+    Returns (printed output, name of the exception raised or None, problem or None).
+    The environment is emptied, so the snippet cannot see API keys.
+    """
+    results = []
+    for seed in ("1", "2"):
+        env = {"PYTHONHASHSEED": seed}
+        if os.name == "nt" and "SYSTEMROOT" in os.environ:
+            env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+        with tempfile.TemporaryDirectory() as folder:
+            try:
+                done = subprocess.run([sys.executable, "-s", "-"], input=code, text=True, env=env,
+                                      capture_output=True, timeout=VERIFY_TIMEOUT, cwd=folder)
+            except subprocess.TimeoutExpired:
+                return "", None, f"its code took longer than {VERIFY_TIMEOUT}s"
+        error = None
+        if done.returncode != 0:
+            last = re.sub(r"\x1b\[[0-9;]*m", "", (done.stderr.strip().splitlines() or ["Error"])[-1])
+            error = last.split(":")[0].strip().split(".")[-1] or "Error"
+        results.append((_normalise(done.stdout), error))
+    if results[0] != results[1]:
+        return "", None, "its output changes from run to run"
+    printed, error = results[0]
+    return printed, error, None
+
+
+def _mcq_problem(question, misconception_ids):
+    """Return why a multiple-choice question is unusable, or None if it passes."""
+    if question["misconception_id"] not in misconception_ids:
+        return "it is not linked to a listed misconception"
+    if not question["stem"].strip():
+        return "it has no question text"
+    options = question["options"]
+    if not 3 <= len(options) <= len(_LETTERS):
+        return f"it has {len(options)} options; it needs 3 to {len(_LETTERS)}"
+    texts = [_normalise(o["text"]) for o in options]
+    if not all(texts):
+        return "one of its options is empty"
+    if len(set(texts)) != len(texts):
+        return "two of its options are the same"
+    correct = [i for i, o in enumerate(options) if o["correct"] is True]
+    if len(correct) != 1:
+        return f"{len(correct)} options are marked correct; exactly 1 must be"
+    right = texts[correct[0]]
+
+    code = question["code"] = _strip_fence(question["code"]).strip("\n")
+    if question["kind"] == "concept":
+        if code:
+            try:
+                ast.parse(code)
+            except SyntaxError:
+                return "its code does not parse"
+        return None
+
+    if not code.strip():
+        return "it asks what code prints but has no code"
+    reason = _unsafe_reason(code)
+    if reason:
+        return f"its code {reason}"
+    printed, error, problem = _run_snippet(code)
+    if problem:
+        return problem
+    if error:
+        if error.lower() not in right.lower():
+            return f"the code raises {error}, but the option marked correct is {right!r}"
+        if any(error.lower() in t.lower() for i, t in enumerate(texts) if i != correct[0]):
+            return f"the code raises {error}, and a wrong option also says so"
+        return None
+    if not printed:
+        return "its code prints nothing"
+    if right != printed:
+        return f"the code prints {printed!r}, but the option marked correct is {right!r}"
+    return None
+
+
+def _check_questions(result):
+    """Split the model's questions into (passed, [(question, reason)])."""
+    ids = {m["id"] for m in result["misconceptions"]}
+    passed, failed = [], []
+    for question in result["questions"]:
+        reason = _mcq_problem(question, ids)
+        if reason:
+            failed.append((question, reason))
+        else:
+            passed.append(question)
+    return passed, failed
+
+
+def _rejection(question, reason):
+    """A dropped question, as recorded in the instructor report."""
+    return {"misconception_id": question["misconception_id"], "stem": question["stem"],
+            "code": question["code"], "reason": reason}
+
+
+def _limit(questions, result, review, per_question):
+    """One question per misconception, and at most per_question per quiz question."""
+    first_function = {m["id"]: (m["quiz_functions"] or [""])[0] for m in result["misconceptions"]}
+    order = {name: i for i, name in enumerate(review)}
+    kept, dropped, used, count = [], [], set(), {}
+    for q in questions:
+        function = q["quiz_function"] if q["quiz_function"] in order else first_function.get(q["misconception_id"], "")
+        q["quiz_function"] = function
+        if q["misconception_id"] in used:
+            dropped.append((q, "another question already practises this misconception"))
+        elif count.get(function, 0) >= per_question:
+            dropped.append((q, f"{function} already has {per_question} question(s)"))
+        else:
+            kept.append(q)
+            used.add(q["misconception_id"])
+            count[function] = count.get(function, 0) + 1
+    kept.sort(key=lambda q: order.get(q["quiz_function"], len(order)))
+    return kept, dropped
+
+
+# --------------------------------------------------------------------------
+# Showing the post-quiz inside the quiz notebook
+# --------------------------------------------------------------------------
+
+_LETTERS = "ABCDE"
+_VERDICTS = {"correct": "Correct", "unfinished": "Unfinished", "slip": "Small slip",
+             "misconception": "Needs practice"}
+
+
+def _show(markdown):
+    try:
+        from IPython.display import Markdown, display
+    except ImportError:
+        print(markdown)
+    else:
+        display(Markdown(markdown))
+
+
+def _inline_code(text):
+    fence = "``" if "`" in text else "`"
+    pad = " " if fence == "``" else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _question_markdown(n, total, q, names):
+    lines = [f"#### Question {n} of {total}"]
+    practises = names.get(q["misconception_id"])
+    if practises:
+        lines.append(f"*Practises: {practises}*")
+    lines.append(q["stem"])
+    if q["code"].strip():
+        lines.append(f"```python\n{q['code']}\n```")
+    for i, option in enumerate(q["options"]):
+        text = option["text"].strip()
+        if q["kind"] == "output":
+            if "\n" in text:
+                lines.append(f"**{_LETTERS[i]}.**\n```\n{text}\n```")
+            else:
+                lines.append(f"**{_LETTERS[i]}.** {_inline_code(text)}")
+        else:
+            lines.append(f"**{_LETTERS[i]}.** {text}")
+    return "\n\n".join(lines)
+
+
+def _save_answers_to_report():
+    path = _state.get("report")
+    if not path or not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        data["post_quiz_answers"] = _state.get("answers", {})
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=1)
+    except (OSError, ValueError):
+        pass
+
+
+def _grade(n, letter):
+    """Record one answer to post-quiz question n. Returns feedback as markdown."""
+    questions = (_state.get("result") or {}).get("questions") or []
+    if not 1 <= n <= len(questions):
+        return f"There is no post-quiz question {n}."
+    q = questions[n - 1]
+    letters = _LETTERS[:len(q["options"])]
+    letter = str(letter).strip().upper()[:1]
+    if not letter or letter not in letters:
+        return f"Choose one of {', '.join(letters)}."
+    tries = _state.setdefault("answers", {}).setdefault(str(n), [])
+    tries.append(letter)
+    _save()
+    _save_answers_to_report()
+
+    chosen = q["options"][letters.index(letter)]
+    if chosen["correct"]:
+        return f"**Correct.** {chosen['why']}"
+    message = f"**Not quite.** {chosen['why']}"
+    wrong = sum(1 for t in tries if not q["options"][letters.index(t)]["correct"])
+    if wrong >= 2:
+        i = next(i for i, o in enumerate(q["options"]) if o["correct"])
+        message += f"\n\nThe answer is **{letters[i]}**. {q['options'][i]['why']}"
+    else:
+        message += " Try again."
+    return message
+
+
+def _show_questions(questions, names):
+    try:
+        import ipywidgets as widgets
+        from IPython.display import display
+    except ImportError:
+        widgets = None
+
+    for n, q in enumerate(questions, 1):
+        _show(_question_markdown(n, len(questions), q, names))
+        if widgets is None:
+            continue
+        pick = widgets.ToggleButtons(options=list(_LETTERS[:len(q["options"])]), value=None,
+                                     description="Your answer:", style={"description_width": "initial"})
+        check = widgets.Button(description="Check answer")
+        out = widgets.Output()
+
+        def clicked(_, n=n, pick=pick, out=out):
+            out.clear_output()
+            with out:
+                if pick.value is None:
+                    _show("Choose an answer first.")
+                    return
+                try:
+                    _show(_grade(n, pick.value))
+                except Exception:  # never show the student a traceback
+                    _internal_errors.append(traceback.format_exc())
+                    _show("Something went wrong checking this answer. Tell your instructor.")
+
+        check.on_click(clicked)
+        display(widgets.HBox([pick, check]), out)
+
+    if widgets is None:
+        _show('Answer each question by running, for example, `quiz_coach.answer(1, "B")` in a new cell.')
+
+
+def _show_result(result):
+    names = {m["id"]: m["name"] for m in result["misconceptions"]}
+    lines = ["### Your post-quiz", "", result["summary"], ""]
+    if result["reviews"]:
+        lines += ["**How each question went**", ""]
+        for r in result["reviews"]:
+            label = _VERDICTS.get(r["verdict"], r["verdict"])
+            lines.append(f"- `{r['function']}`: **{label}.** {r['comment']}")
+        lines.append("")
+    if not result["misconceptions"]:
+        lines.append("Nothing to practise: no misunderstandings showed up in your answers.")
+        _show("\n".join(lines))
+        return
+    lines += ["**What to work on**", ""]
+    for m in result["misconceptions"]:
+        lines.append(f"- **{m['name']}.** {m['what_happened']} {m['explanation']}")
+    lines.append("")
+    if result["questions"]:
+        lines.append(f"Answer the {len(result['questions'])} question(s) below. "
+                     "They do not affect your mark.")
+    else:
+        lines.append("No practice questions could be prepared this time; read the notes above.")
+    _show("\n".join(lines))
+    _show_questions(result["questions"], names)
