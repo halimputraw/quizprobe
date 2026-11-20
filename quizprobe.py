@@ -1,3 +1,80 @@
+"""
+quiz_coach - reviews a student's answers in a Jupyter coding quiz and gives
+them a short multiple-choice post-quiz on the misunderstandings it finds.
+
+Add it to a quiz notebook with two cells:
+
+    # first code cell of the quiz
+    import quiz_coach
+    quiz_coach.start(quiz_id="quiz3")
+
+    # last code cell of the quiz (the student runs it when they finish)
+    quiz_coach.finish(provider="gemini", model="gemini-4-hydrogen")
+    # or quiz_coach.finish_button(provider=..., model=...)
+
+Between those two cells nothing changes. The coach watches every cell the
+student runs and records:
+
+  * each version of every function the student defines,
+  * every test cell (cells with `assert`) that fails or passes, including what
+    the student's function actually returned,
+  * runtime errors raised by the student's functions.
+
+Syntax errors are counted but never analysed.
+
+Test cells are labelled automatically: a cell containing "Pre-check" is a
+precheck, a cell containing "hidden" is a hidden check, anything else is a
+check. Add the comment `# coach: hidden` (or precheck / check) to a cell to
+label it yourself. For hidden tests the student must not see, call
+`quiz_coach.hidden_check("function_name", cases)` instead of writing asserts.
+
+`finish()` sends each question's text, the student's code (every version) and
+the test results to an AI model. The model reviews every question, including
+ones whose tests passed, names the misconceptions it finds, and writes one
+multiple-choice question per misconception, at most two per quiz question.
+Questions that ask what a piece of code prints are run locally first; one
+whose marked answer differs from the real output is sent back to the model
+once for repair, and dropped if it is still wrong. The post-quiz appears
+below the finish cell, with buttons to answer, so the student never has to
+open another file. quiz_coach_report.json keeps everything for the
+instructor, including the student's post-quiz answers.
+
+Three kinds of AI provider are supported:
+
+  * Claude (default). Requires `pip install anthropic` and credentials the
+    Anthropic SDK can find, for example the ANTHROPIC_API_KEY environment
+    variable on the machine that runs the kernel. Never paste an API key into
+    the notebook itself.
+  * A local model served by Ollama. Needs no key and no extra package:
+
+        quiz_coach.finish(provider="ollama", model="hermes3")
+
+    Ollama must be running and the model already downloaded
+    (`ollama pull hermes3`). Small local models review less reliably than
+    Claude and more of their questions are rejected by the local check.
+  * A hosted service with a free tier that speaks the OpenAI chat format.
+    Needs no extra package. Presets exist for "gemini", "groq" and
+    "openrouter"; anything else works through "openai-compatible":
+
+        quiz_coach.finish(provider="gemini", model="<model name>")
+        quiz_coach.finish(provider="gemini", model=["<first choice>", "<backup>"])
+        quiz_coach.finish(provider="openai-compatible", model="<model name>",
+                          base_url="https://example.com/v1")
+
+    The key is read from an environment variable on the machine that runs the
+    kernel: GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, or
+    QUIZ_COACH_API_KEY for "openai-compatible" (change it with api_key_env=).
+    If the variable is not in the kernel's environment, an `export NAME="..."`
+    line in the user's shell profile (~/.zshrc and similar) is used instead.
+    Free tiers limit requests per minute and per day, and some use what you
+    send to improve their products, so check the provider's terms before
+    sending student work.
+
+The buttons need ipywidgets, which JupyterLab and Notebook 7 support. Without
+it, students answer with quiz_coach.answer(1, "B").
+"""
+
+
 from __future__ import annotations
 
 import ast
@@ -1144,3 +1221,162 @@ def _show_result(result):
         lines.append("No practice questions could be prepared this time; read the notes above.")
     _show("\n".join(lines))
     _show_questions(result["questions"], names)
+def post_quiz():
+    """Show the post-quiz again, for example after the kernel was restarted."""
+    if not _state.get("result"):
+        _show("There is no post-quiz yet. Run `quiz_coach.finish(...)` first.")
+        return
+    _show_result(_state["result"])
+
+
+def answer(n, letter):
+    """Answer post-quiz question n with a letter, e.g. answer(1, "B").
+
+    The buttons under each question do the same; this is for setups where the
+    buttons do not appear.
+    """
+    _show(_grade(int(n), letter))a
+
+
+def finish(provider="claude", model=None, max_per_question=2, effort="medium", base_url=None,
+           options=None, api_key_env=None, report="quiz_coach_report.json",
+           client=None, llm=None, force=False):
+    """Review the attempt and show the post-quiz below this cell. Run it once, at the end.
+
+    provider          "claude" (default), "ollama" for a local model, or a hosted
+                      service: "gemini", "groq", "openrouter", "openai-compatible".
+    model             model name. Optional for Claude, required otherwise: the
+                      name you pulled in Ollama, or a name from the service's
+                      model list. For hosted services it may be a list of names
+                      to try in order, used when a model is overloaded.
+    max_per_question  most multiple-choice questions for one quiz question; each
+                      one practises a different misconception.
+    effort            Claude only: low / medium / high.
+    base_url          server address. Optional for Ollama and the presets;
+                      required for "openai-compatible" (the part before
+                      /chat/completions).
+    options           Ollama only: extra model settings, e.g. {"num_ctx": 16384}.
+    api_key_env       hosted services only: name of the environment variable
+                      that holds the key, if not the default for that provider.
+    report            file name of the instructor report (JSON), or None.
+    client            a ready anthropic.Anthropic client, e.g. one pointing at a
+                      proxy with base_url=... so that students never hold the key.
+    llm               for testing: a function taking the request text and
+                      returning the result dict, used instead of a real model.
+    force             review again even if a post-quiz was already made.
+
+    Returns the result dict, or None if nothing was produced.
+    """
+    provider = str(provider).lower()
+    if provider not in ("claude", "ollama") and provider not in _PRESETS:
+        raise ValueError('provider must be one of: claude, ollama, ' + ", ".join(_PRESETS) + ".")
+    if provider != "claude" and not model:
+        raise ValueError(f'Name the model, e.g. finish(provider="{provider}", model="...").')
+    if provider == "openai-compatible" and not base_url:
+        raise ValueError('provider="openai-compatible" needs base_url, e.g. "https://example.com/v1".')
+    model = model or DEFAULT_MODEL
+
+    if _state.get("result") and not force:
+        _show_result(_state["result"])
+        return _state["result"]
+
+    evidence, review = _evidence()
+    if not review:
+        _show("### No post-quiz needed\n\nNo answers were recorded in this attempt.")
+        return None
+
+    request = (f"Here is the record of the student's attempt.\n\n{evidence}\n\n"
+               "Review every question above. Write one multiple-choice question per "
+               f"misconception, and no more than {max_per_question} for any one quiz question.")
+    record = {"created": datetime.datetime.now().isoformat(timespec="seconds"),
+              "quiz_id": _config["quiz_id"], "provider": provider, "model": model,
+              "syntax_errors_ignored": _state["syntax_errors"], "evidence": evidence}
+
+    def write_report():
+        if report:
+            with open(report, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=1)
+
+    def ask(text):
+        if llm is not None:
+            return llm(text)
+        if provider == "ollama":
+            return _ask_ollama(text, model, base_url, options)
+        if provider in _PRESETS:
+            result, record["answered_by"], skipped = _ask_compatible(
+                text, provider, model, base_url, api_key_env)
+            record.setdefault("skipped_models", []).extend(skipped)
+            return result
+        return _ask_claude(text, model, effort, client)
+
+    print("Reviewing your answers. This can take a minute, or several on a local model...")
+    try:
+        result = ask(request)
+        passed, failed = _check_questions(result)
+        if failed:
+            # One chance to repair: tell the model exactly what the check found.
+            record["first_answer_rejected"] = [_rejection(q, r) for q, r in failed]
+            repair = (request + "\n\n<previous_answer>\n" + json.dumps(result, indent=1)
+                      + "\n</previous_answer>\n\nAn automatic check ran the code in your "
+                      "multiple-choice questions and rejected these:\n"
+                      + "\n".join(f"- questions[{result['questions'].index(q)}] "
+                                  f"(misconception {q['misconception_id']}): {r}" for q, r in failed)
+                      + "\n\nSend the complete answer again, with the rejected questions "
+                      "corrected or replaced. Keep everything else unless the check shows it was wrong.")
+            try:
+                second = ask(repair)
+            except CoachError as err:
+                record["repair_error"] = str(err)
+            else:
+                passed2, failed2 = _check_questions(second)
+                if len(passed2) >= len(passed):
+                    result, passed, failed = second, passed2, failed2
+    except CoachError as err:
+        record["error"] = str(err)
+        write_report()
+        _show(f"### The post-quiz could not be created\n\n{err}\n\nTell your instructor. "
+              "Your attempt is not affected.")
+        return None
+    except Exception:  # a student should never see a traceback from the coach
+        record["error"] = traceback.format_exc()
+        write_report()
+        _show("### The post-quiz could not be created\n\nSomething unexpected went wrong. "
+              "Tell your instructor. Your attempt is not affected.")
+        return None
+
+    kept, over_limit = _limit(passed, result, review, max_per_question)
+    result["questions"] = kept
+    record.update(result=result, dropped_questions=[_rejection(q, r) for q, r in failed + over_limit])
+    write_report()
+
+    _state.update(result=result, report=report, answers={})
+    _save()
+    ip = _ipython()
+    if ip is not None and _config["active"]:
+        try:
+            ip.events.unregister("post_run_cell", _on_cell)
+        except ValueError:
+            pass
+        _config["active"] = False
+    _show_result(result)
+    return result
+
+
+def finish_button(**options):
+    """Show a "Finish attempt" button that runs finish(**options) when clicked."""
+    try:
+        import ipywidgets
+        from IPython.display import display
+    except ImportError:
+        print("ipywidgets is not installed. Run quiz_coach.finish() in a cell instead.")
+        return
+    button = ipywidgets.Button(description="Finish attempt", button_style="primary")
+    output = ipywidgets.Output()
+
+    def clicked(_):
+        button.disabled = True
+        with output:
+            finish(**options)
+
+    button.on_click(clicked)
+    display(button, output)

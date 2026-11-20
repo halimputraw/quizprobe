@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quiz-coach"
+version = "0.1.0"
+description = "Reviews students' Jupyter quiz answers and gives a short post-quiz on their misconceptions"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["jupyter", "education", "quiz", "teaching", "llm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Framework :: Jupyter",
+    "Intended Audience :: Education",
+    "Topic :: Education",
+]
+
+[project.optional-dependencies]
+claude = ["anthropic"]
+widgets = ["ipywidgets"]
+all = ["anthropic", "ipywidgets"]
+
+[project.urls]
+Homepage = "https://github.com/halimputraw/quiz-coach"
+Issues = "https://github.com/halimputraw/quiz-coach/issues"
+
+[tool.setuptools]
+py-modules = ["quiz_coach"]
