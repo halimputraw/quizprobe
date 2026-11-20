@@ -3,13 +3,13 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "quiz-coach"
+name = "quizprobe"
 version = "0.1.0"
-description = "Reviews students' Jupyter quiz answers and gives a short post-quiz on their misconceptions"
+description = "Reviews students' Jupyter quiz answers with any Google Gemini model and gives a short post-quiz on their misconceptions"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
-keywords = ["jupyter", "education", "quiz", "teaching", "llm"]
+keywords = ["jupyter", "education", "quiz", "teaching", "gemini", "google-gemini", "llm"]
 classifiers = [
     "Programming Language :: Python :: 3",
     "Framework :: Jupyter",
@@ -18,13 +18,11 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-claude = ["anthropic"]
 widgets = ["ipywidgets"]
-all = ["anthropic", "ipywidgets"]
 
 [project.urls]
-Homepage = "https://github.com/halimputraw/quiz-coach"
-Issues = "https://github.com/halimputraw/quiz-coach/issues"
+Homepage = "https://github.com/halimputraw/quizprobe"
+Issues = "https://github.com/halimputraw/quizprobe/issues"
 
 [tool.setuptools]
-py-modules = ["quiz_coach"]
+py-modules = ["quizprobe"]

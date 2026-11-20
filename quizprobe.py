@@ -1,18 +1,18 @@
 """
-quiz_coach - reviews a student's answers in a Jupyter coding quiz and gives
+quizprobe - reviews a student's answers in a Jupyter coding quiz and gives
 them a short multiple-choice post-quiz on the misunderstandings it finds.
 
 Add it to a quiz notebook with two cells:
 
     # first code cell of the quiz
-    import quiz_coach
-    quiz_coach.start(quiz_id="quiz3")
+    import quizprobe
+    quizprobe.start(quiz_id="quiz3")
 
     # last code cell of the quiz (the student runs it when they finish)
-    quiz_coach.finish(provider="gemini", model="gemini-4-hydrogen")
-    # or quiz_coach.finish_button(provider=..., model=...)
+    quizprobe.finish()
+    # or quizprobe.finish_button()
 
-Between those two cells nothing changes. The coach watches every cell the
+Between those two cells nothing changes. quizprobe watches every cell the
 student runs and records:
 
   * each version of every function the student defines,
@@ -24,9 +24,9 @@ Syntax errors are counted but never analysed.
 
 Test cells are labelled automatically: a cell containing "Pre-check" is a
 precheck, a cell containing "hidden" is a hidden check, anything else is a
-check. Add the comment `# coach: hidden` (or precheck / check) to a cell to
+check. Add the comment `# quizprobe: hidden` (or precheck / check) to a cell to
 label it yourself. For hidden tests the student must not see, call
-`quiz_coach.hidden_check("function_name", cases)` instead of writing asserts.
+`quizprobe.hidden_check("function_name", cases)` instead of writing asserts.
 
 `finish()` sends each question's text, the student's code (every version) and
 the test results to an AI model. The model reviews every question, including
@@ -36,44 +36,31 @@ Questions that ask what a piece of code prints are run locally first; one
 whose marked answer differs from the real output is sent back to the model
 once for repair, and dropped if it is still wrong. The post-quiz appears
 below the finish cell, with buttons to answer, so the student never has to
-open another file. quiz_coach_report.json keeps everything for the
+open another file. quizprobe_report.json keeps everything for the
 instructor, including the student's post-quiz answers.
 
-Three kinds of AI provider are supported:
+The review is done by a Google Gemini model. Any Gemini model your API key can
+use works; gemini-4-hydrogen is the default. Name a different one, or a list
+to try in order (the next is used when one is overloaded or unavailable):
 
-  * Claude (default). Requires `pip install anthropic` and credentials the
-    Anthropic SDK can find, for example the ANTHROPIC_API_KEY environment
-    variable on the machine that runs the kernel. Never paste an API key into
-    the notebook itself.
-  * A local model served by Ollama. Needs no key and no extra package:
+    quizprobe.finish(model="gemini-3.1-flash-lite")
+    quizprobe.finish(model=["gemini-4-hydrogen", "gemini-3.1-flash-lite"])
 
-        quiz_coach.finish(provider="ollama", model="hermes3")
+Model names are the IDs from Google's Gemini API model list. Larger models
+usually review more reliably; smaller "flash" and "lite" models are faster,
+cheaper and less often overloaded.
 
-    Ollama must be running and the model already downloaded
-    (`ollama pull hermes3`). Small local models review less reliably than
-    Claude and more of their questions are rejected by the local check.
-  * A hosted service with a free tier that speaks the OpenAI chat format.
-    Needs no extra package. Presets exist for "gemini", "groq" and
-    "openrouter"; anything else works through "openai-compatible":
-
-        quiz_coach.finish(provider="gemini", model="<model name>")
-        quiz_coach.finish(provider="gemini", model=["<first choice>", "<backup>"])
-        quiz_coach.finish(provider="openai-compatible", model="<model name>",
-                          base_url="https://example.com/v1")
-
-    The key is read from an environment variable on the machine that runs the
-    kernel: GEMINI_API_KEY, GROQ_API_KEY, OPENROUTER_API_KEY, or
-    QUIZ_COACH_API_KEY for "openai-compatible" (change it with api_key_env=).
-    If the variable is not in the kernel's environment, an `export NAME="..."`
-    line in the user's shell profile (~/.zshrc and similar) is used instead.
-    Free tiers limit requests per minute and per day, and some use what you
-    send to improve their products, so check the provider's terms before
-    sending student work.
+It needs no extra package, only a Gemini API key in the GEMINI_API_KEY
+environment variable on the machine that runs the kernel. If the variable is not in the kernel's
+environment, an `export GEMINI_API_KEY="..."` line in the user's shell profile
+(~/.zshrc and similar) is used instead. Never paste an API key into the
+notebook itself. The free tier limits requests per minute and per day, and
+may use what you send to improve Google's products, so check the terms before
+sending student work.
 
 The buttons need ipywidgets, which JupyterLab and Notebook 7 support. Without
-it, students answer with quiz_coach.answer(1, "B").
+it, students answer with quizprobe.answer(1, "B").
 """
-
 
 from __future__ import annotations
 
@@ -98,19 +85,11 @@ import urllib.request
 __all__ = ["start", "finish", "finish_button", "post_quiz", "answer",
            "hidden_check", "status", "reset"]
 
-DEFAULT_PROVIDER = "gemini"
 DEFAULT_MODEL = "gemini-4-hydrogen"
-OLLAMA_URL = "http://localhost:11434"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+GEMINI_KEY_ENV = "GEMINI_API_KEY"
 ANSWER_TRIES = 3      # attempts to get a usable answer from the model
-RATE_LIMIT_RETRIES = 2  # extra tries when a hosted service says "too many requests"
-
-# provider -> (name shown in messages, base URL, environment variable holding the key)
-_PRESETS = {
-    "gemini": ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),
-    "groq": ("Groq", "https://api.groq.com/openai/v1", "GROQ_API_KEY"),
-    "openrouter": ("OpenRouter", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
-    "openai-compatible": ("The AI service", None, "QUIZPROBE_API_KEY"),
-}
+RATE_LIMIT_RETRIES = 2  # extra tries when Gemini says "too many requests"
 MAX_VERSIONS = 4      # code versions per function sent to the model
 MAX_FAILURES = 12     # failed test runs per function sent to the model
 VERIFY_TIMEOUT = 10   # seconds allowed for one generated code snippet
@@ -127,7 +106,7 @@ _BANNED_NAMES = {
 }
 
 
-class CoachError(Exception):
+class QuizprobeError(Exception):
     """A problem the student or instructor should be told about in plain words."""
 
     def __init__(self, message, status=None):
@@ -190,7 +169,7 @@ def _add_attempt(name, code):
 def _capture(name):
     """Record the current code of function `name` if it differs from the last version seen.
 
-    Tests can run on a function the coach never saw being written, for example
+    Tests can run on a function quizprobe never saw being written, for example
     one defined before start() or reset(), or before a kernel restart that
     reloaded the record. Reading its source when it is tested keeps the code
     and the test results together.
@@ -220,7 +199,7 @@ def _add_event(function, kind, passed, **details):
 
 
 def _kind_of(raw_cell):
-    marked = re.search(r"#\s*coach:\s*(precheck|check|hidden)", raw_cell, re.I)
+    marked = re.search(r"#\s*quizprobe:\s*(precheck|check|hidden)", raw_cell, re.I)
     if marked:
         return marked.group(1).lower()
     low = raw_cell.lower()
@@ -250,7 +229,8 @@ def _user_frames(err):
 
 def _observe(result):
     raw = result.info.raw_cell or ""
-    if "quizprobe" in raw:
+    # Skip quizprobe's own cells, but not test cells that only carry a label.
+    if "quizprobe" in re.sub(r"#\s*quizprobe:\s*\w+", "", raw, flags=re.I):
         return
     err = result.error_before_exec or result.error_in_exec
     if isinstance(err, SyntaxError):
@@ -333,8 +313,9 @@ def _observe(result):
 def _on_cell(result):
     try:
         _observe(result)
-    except Exception:  # the coach must never interrupt a quiz
+    except Exception:  # quizprobe must never interrupt a quiz
         _internal_errors.append(traceback.format_exc())
+
 
 def start(quiz_id="quiz", notebook=None, persist=True):
     """Start recording. Safe to run more than once; it never clears the record.
@@ -375,7 +356,7 @@ def status():
     print(f"Test runs recorded: {len(_state['events'])} ({failed} failed)")
     print(f"Syntax errors ignored: {_state['syntax_errors']}")
     if _internal_errors:
-        print(f"Internal coach errors: {len(_internal_errors)} (last one below)")
+        print(f"Internal quizprobe errors: {len(_internal_errors)} (last one below)")
         print(_internal_errors[-1])
 
 
@@ -606,9 +587,15 @@ fix may have been trial and error; in that case the verdict can be correct \
 while the misconception is still listed. Failed test runs are evidence even \
 when the code that produced them is not shown (code_version 0): what the \
 function returned tells you what that code did. If the same belief shows up in \
-several questions, list it once with all of them. If nothing shows a \
-misconception, return empty lists: an honest "nothing to practise" is better \
-than an invented one, because the student will spend time on whatever you name.
+several questions, list it once with all of them.
+A question with any failed test run always gets at least one misconception \
+and one practice question, even when the final code is correct and even when \
+the failure looks like a slip or trial and error: name the belief the failing \
+version reveals, using what it returned compared with what was expected, and \
+give the verdict for the final code as usual. Only for questions where no test \
+run failed and nothing shows a misconception, add nothing: an honest "nothing \
+to practise" is better than an invented one, because the student will spend \
+time on whatever you name.
 
 Part 2: write one multiple-choice question for each misconception, set in a \
 fresh context so the student cannot answer by recalling their quiz code. \
@@ -702,6 +689,8 @@ _SCHEMA = {
     "required": ["summary", "reviews", "misconceptions", "questions"],
     "additionalProperties": False,
 }
+
+
 def _shape_problem(value, schema, where="answer"):
     """Return how a model's answer departs from the schema, or None if it fits."""
     kind = schema.get("type")
@@ -745,7 +734,7 @@ def _ssl_context():
     return ssl.create_default_context(cafile=certifi.where())
 
 
-def _post_json(url, body, headers=None, service="Ollama", timeout=900, retries=None, max_wait=60):
+def _post_json(url, body, headers=None, service="Gemini", timeout=900, retries=None, max_wait=60):
     data = json.dumps(body).encode("utf-8")
     all_headers = {"Content-Type": "application/json", "User-Agent": "quizprobe/1.0"}
     all_headers.update(headers or {})
@@ -773,21 +762,22 @@ def _post_json(url, body, headers=None, service="Ollama", timeout=900, retries=N
                 time.sleep(min(float(wait) if wait.replace(".", "", 1).isdigit() else 20, max_wait))
                 continue
             if busy:
-                raise CoachError(f"{service} is overloaded right now ({detail}). Wait a minute, "
+                raise QuizprobeError(f"{service} is overloaded right now ({detail}). Wait a minute, "
                                  "then run this cell again.", err.code) from None
             if err.code == 429:
-                raise CoachError(f"{service}'s rate limit was reached. Wait a minute, "
+                raise QuizprobeError(f"{service}'s rate limit was reached. Wait a minute, "
                                  "then run this cell again.", 429) from None
             if err.code in (401, 403):
-                raise CoachError(f"{service} rejected the API key ({detail}).", err.code) from None
+                raise QuizprobeError(f"{service} rejected the API key ({detail}).", err.code) from None
             if err.code == 404:
-                raise CoachError(f"{service} could not find the model or address ({detail}).", 404) from None
-            raise CoachError(f"{service} returned an error ({err.code}): {detail}", err.code) from None
+                raise QuizprobeError(f"{service} could not find the model ({detail}). Check the "
+                                     "name against Google's Gemini model list.", 404) from None
+            raise QuizprobeError(f"{service} returned an error ({err.code}): {detail}", err.code) from None
         except (urllib.error.URLError, OSError) as err:
             reason = str(getattr(err, "reason", err))
             if "CERTIFICATE_VERIFY_FAILED" in reason:
                 reason += ". This Python has no root certificates; run: pip install certifi"
-            raise CoachError(f"Could not reach {service} at {url} ({reason}).") from None
+            raise QuizprobeError(f"Could not reach {service} at {url} ({reason}).") from None
 
 
 def _plain_messages(user_message):
@@ -816,30 +806,8 @@ def _until_valid(messages, send, label):
         messages += [{"role": "assistant", "content": text},
                      {"role": "user", "content": f"That answer cannot be used: {problem}. "
                                                  "Send the complete corrected JSON object only."}]
-    raise CoachError(f"The model '{label}' did not give a usable answer in "
+    raise QuizprobeError(f"The model '{label}' did not give a usable answer in "
                      f"{ANSWER_TRIES} tries (last problem: {problem}).")
-
-
-def _ask_ollama(user_message, model, base_url=None, options=None):
-    url = (base_url or OLLAMA_URL).rstrip("/") + "/api/chat"
-    messages = _plain_messages(user_message)
-    # Ollama silently cuts off a prompt that is longer than its context window,
-    # so ask for a window big enough for the whole record plus the answer.
-    settings = {"temperature": 0.2,
-                "num_ctx": max(8192, sum(len(m["content"]) for m in messages) // 3 + 6000)}
-    settings.update(options or {})
-
-    def send(messages):
-        try:
-            reply = _post_json(url, {"model": model, "messages": messages, "stream": False,
-                                     "format": _SCHEMA, "options": settings})
-        except CoachError as err:
-            hint = {404: f" Run: ollama pull {model}", None: " Is Ollama running?"}.get(err.status, "")
-            raise CoachError(str(err) + hint, err.status) from None
-        text = (reply.get("message") or {}).get("content") or ""
-        return text, reply.get("done_reason") == "length"
-
-    return _until_valid(messages, send, model)
 
 
 def _find_key(name):
@@ -868,22 +836,21 @@ def _find_key(name):
     return None
 
 
-def _ask_compatible(user_message, provider, model, base_url=None, api_key_env=None):
-    """Ask any hosted service that speaks the OpenAI chat-completions format.
+def _ask_gemini(user_message, model=DEFAULT_MODEL):
+    """Ask Gemini through its chat-completions endpoint.
 
-    model may be one name or a list of names to try in order. The next one is
+    model may be one name or a list of names to try in order; the next one is
     used when a model is overloaded, rate limited, unavailable, too slow, or
     gives unusable answers. Returns (result, name of the model that answered,
     list of skipped models with the reason for each).
     """
-    service, default_url, default_env = _PRESETS[provider]
-    env = api_key_env or default_env
-    key = _find_key(env)
+    service = "Gemini"
+    key = _find_key(GEMINI_KEY_ENV)
     if not key:
-        raise CoachError(f"No API key was found. Set the {env} environment variable on the "
-                         "machine that runs the notebook kernel, or add the line "
-                         f'export {env}="..." to ~/.zshrc.')
-    url = (base_url or default_url).rstrip("/") + "/chat/completions"
+        raise QuizprobeError(f"No API key was found. Set the {GEMINI_KEY_ENV} environment variable "
+                         "on the machine that runs the notebook kernel, or add the line "
+                         f'export {GEMINI_KEY_ENV}="..." to ~/.zshrc.')
+    url = GEMINI_URL + "/chat/completions"
     headers = {"Authorization": f"Bearer {key}"}
     models = [model] if isinstance(model, str) else list(model)
     skipped = []
@@ -900,10 +867,10 @@ def _ask_compatible(user_message, provider, model, base_url=None, api_key_env=No
                 return _post_json(url, body, headers, service, timeout=180, **limits)
             try:
                 reply = post({"model": name, "messages": messages, **extra})
-            except CoachError as err:
+            except QuizprobeError as err:
                 if err.status != 400 or not extra:
                     raise
-                extra.clear()  # this service or model has no JSON mode; rely on the instructions
+                extra.clear()  # this model has no JSON mode; rely on the instructions
                 reply = post({"model": name, "messages": messages})
             choice = (reply.get("choices") or [{}])[0]
             return ((choice.get("message") or {}).get("content") or "",
@@ -911,13 +878,15 @@ def _ask_compatible(user_message, provider, model, base_url=None, api_key_env=No
 
         try:
             return _until_valid(_plain_messages(user_message), send, name), name, skipped
-        except CoachError as err:
+        except QuizprobeError as err:
             # A bad request or a rejected key will fail on every model, so stop there.
             if is_last or err.status in (400, 401, 403):
                 raise
             skipped.append({"model": name, "reason": str(err)})
+
+
 def _strip_fence(code):
-    """Local models often wrap code in ``` fences; remove them."""
+    """Models sometimes wrap code in ``` fences; remove them."""
     match = re.fullmatch(r"\s*```[\w+-]*\n(.*?)\n?```\s*", code, re.S)
     return match.group(1) if match else code
 
@@ -1048,6 +1017,23 @@ def _check_questions(result):
         else:
             passed.append(question)
     return passed, failed
+
+
+def _failed_functions(review):
+    """Quiz functions with at least one failed test run, even if fixed later."""
+    failed = {e["function"] for e in _state["events"]
+              if e["kind"] != "experiment" and not e["passed"]}
+    return [name for name in review if name in failed]
+
+
+def _missing_practice(result, questions, needed):
+    """Functions in `needed` that no usable question practises."""
+    functions = {m["id"]: set(m["quiz_functions"]) for m in result["misconceptions"]}
+    covered = set()
+    for q in questions:
+        covered.add(q["quiz_function"])
+        covered |= functions.get(q["misconception_id"], set())
+    return [name for name in needed if name not in covered]
 
 
 def _rejection(question, reason):
@@ -1194,7 +1180,7 @@ def _show_questions(questions, names):
         display(widgets.HBox([pick, check]), out)
 
     if widgets is None:
-        _show('Answer each question by running, for example, `quiz_coach.answer(1, "B")` in a new cell.')
+        _show('Answer each question by running, for example, `quizprobe.answer(1, "B")` in a new cell.')
 
 
 def _show_result(result):
@@ -1221,10 +1207,12 @@ def _show_result(result):
         lines.append("No practice questions could be prepared this time; read the notes above.")
     _show("\n".join(lines))
     _show_questions(result["questions"], names)
+
+
 def post_quiz():
     """Show the post-quiz again, for example after the kernel was restarted."""
     if not _state.get("result"):
-        _show("There is no post-quiz yet. Run `quiz_coach.finish(...)` first.")
+        _show("There is no post-quiz yet. Run `quizprobe.finish(...)` first.")
         return
     _show_result(_state["result"])
 
@@ -1235,46 +1223,32 @@ def answer(n, letter):
     The buttons under each question do the same; this is for setups where the
     buttons do not appear.
     """
-    _show(_grade(int(n), letter))a
+    _show(_grade(int(n), letter))
 
 
-def finish(provider="claude", model=None, max_per_question=2, effort="medium", base_url=None,
-           options=None, api_key_env=None, report="quiz_coach_report.json",
-           client=None, llm=None, force=False):
+def finish(model=DEFAULT_MODEL, max_per_question=2, report="quizprobe_report.json",
+           llm=None, force=False):
     """Review the attempt and show the post-quiz below this cell. Run it once, at the end.
 
-    provider          "claude" (default), "ollama" for a local model, or a hosted
-                      service: "gemini", "groq", "openrouter", "openai-compatible".
-    model             model name. Optional for Claude, required otherwise: the
-                      name you pulled in Ollama, or a name from the service's
-                      model list. For hosted services it may be a list of names
-                      to try in order, used when a model is overloaded.
+    model             any Gemini model name, e.g. "gemini-3.1-flash-lite", or a
+                      list of names to try in order when one is overloaded or
+                      unavailable. Default: "gemini-4-hydrogen".
     max_per_question  most multiple-choice questions for one quiz question; each
                       one practises a different misconception.
-    effort            Claude only: low / medium / high.
-    base_url          server address. Optional for Ollama and the presets;
-                      required for "openai-compatible" (the part before
-                      /chat/completions).
-    options           Ollama only: extra model settings, e.g. {"num_ctx": 16384}.
-    api_key_env       hosted services only: name of the environment variable
-                      that holds the key, if not the default for that provider.
     report            file name of the instructor report (JSON), or None.
-    client            a ready anthropic.Anthropic client, e.g. one pointing at a
-                      proxy with base_url=... so that students never hold the key.
     llm               for testing: a function taking the request text and
                       returning the result dict, used instead of a real model.
     force             review again even if a post-quiz was already made.
 
     Returns the result dict, or None if nothing was produced.
     """
-    provider = str(provider).lower()
-    if provider not in ("claude", "ollama") and provider not in _PRESETS:
-        raise ValueError('provider must be one of: claude, ollama, ' + ", ".join(_PRESETS) + ".")
-    if provider != "claude" and not model:
-        raise ValueError(f'Name the model, e.g. finish(provider="{provider}", model="...").')
-    if provider == "openai-compatible" and not base_url:
-        raise ValueError('provider="openai-compatible" needs base_url, e.g. "https://example.com/v1".')
-    model = model or DEFAULT_MODEL
+    if isinstance(model, str):
+        model = model.strip()
+    else:
+        model = [str(m).strip() for m in model if str(m).strip()]
+    if not model:
+        raise ValueError('Name a Gemini model, e.g. finish(model="gemini-3.1-flash-lite"), '
+                         'or a list of them.')
 
     if _state.get("result") and not force:
         _show_result(_state["result"])
@@ -1288,8 +1262,13 @@ def finish(provider="claude", model=None, max_per_question=2, effort="medium", b
     request = (f"Here is the record of the student's attempt.\n\n{evidence}\n\n"
                "Review every question above. Write one multiple-choice question per "
                f"misconception, and no more than {max_per_question} for any one quiz question.")
+    needs_practice = _failed_functions(review)
+    if needs_practice:
+        request += ("\n\nThese quiz questions had at least one failed test run, so each must get "
+                    "at least one misconception and one practice question, even if the final "
+                    "code is correct: " + ", ".join(needs_practice) + ".")
     record = {"created": datetime.datetime.now().isoformat(timespec="seconds"),
-              "quiz_id": _config["quiz_id"], "provider": provider, "model": model,
+              "quiz_id": _config["quiz_id"], "provider": "gemini", "model": model,
               "syntax_errors_ignored": _state["syntax_errors"], "evidence": evidence}
 
     def write_report():
@@ -1300,16 +1279,11 @@ def finish(provider="claude", model=None, max_per_question=2, effort="medium", b
     def ask(text):
         if llm is not None:
             return llm(text)
-        if provider == "ollama":
-            return _ask_ollama(text, model, base_url, options)
-        if provider in _PRESETS:
-            result, record["answered_by"], skipped = _ask_compatible(
-                text, provider, model, base_url, api_key_env)
-            record.setdefault("skipped_models", []).extend(skipped)
-            return result
-        return _ask_claude(text, model, effort, client)
+        result, record["answered_by"], skipped = _ask_gemini(text, model)
+        record.setdefault("skipped_models", []).extend(skipped)
+        return result
 
-    print("Reviewing your answers. This can take a minute, or several on a local model...")
+    print("Reviewing your answers. This can take a minute...")
     try:
         result = ask(request)
         passed, failed = _check_questions(result)
@@ -1325,19 +1299,38 @@ def finish(provider="claude", model=None, max_per_question=2, effort="medium", b
                       "corrected or replaced. Keep everything else unless the check shows it was wrong.")
             try:
                 second = ask(repair)
-            except CoachError as err:
+            except QuizprobeError as err:
                 record["repair_error"] = str(err)
             else:
                 passed2, failed2 = _check_questions(second)
                 if len(passed2) >= len(passed):
                     result, passed, failed = second, passed2, failed2
-    except CoachError as err:
+        missing = _missing_practice(result, passed, needs_practice)
+        if missing:
+            # A test failed but the model wrote nothing to practise for it: ask once more.
+            record["missing_practice"] = missing
+            follow_up = (request + "\n\n<previous_answer>\n" + json.dumps(result, indent=1)
+                         + "\n</previous_answer>\n\nYour answer has no usable practice question for "
+                         + ", ".join(missing) + ", although a test run for each of them failed. "
+                         "Add at least one misconception and one multiple-choice question for each, "
+                         "about what the failing version got wrong. Send the complete answer again "
+                         "and keep everything else.")
+            try:
+                third = ask(follow_up)
+            except QuizprobeError as err:
+                record["missing_practice_error"] = str(err)
+            else:
+                passed3, failed3 = _check_questions(third)
+                if (len(_missing_practice(third, passed3, needs_practice)) < len(missing)
+                        and len(passed3) >= len(passed)):
+                    result, passed, failed = third, passed3, failed3
+    except QuizprobeError as err:
         record["error"] = str(err)
         write_report()
         _show(f"### The post-quiz could not be created\n\n{err}\n\nTell your instructor. "
               "Your attempt is not affected.")
         return None
-    except Exception:  # a student should never see a traceback from the coach
+    except Exception:  # a student should never see a traceback from quizprobe
         record["error"] = traceback.format_exc()
         write_report()
         _show("### The post-quiz could not be created\n\nSomething unexpected went wrong. "
@@ -1368,7 +1361,7 @@ def finish_button(**options):
         import ipywidgets
         from IPython.display import display
     except ImportError:
-        print("ipywidgets is not installed. Run quiz_coach.finish() in a cell instead.")
+        print("ipywidgets is not installed. Run quizprobe.finish() in a cell instead.")
         return
     button = ipywidgets.Button(description="Finish attempt", button_style="primary")
     output = ipywidgets.Output()
