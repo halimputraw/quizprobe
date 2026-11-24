@@ -5,6 +5,8 @@ Google **Gemini** to find the misunderstandings behind their mistakes, then
 gives them a short multiple-choice post-quiz right inside the notebook. Any
 Gemini model works; `gemini-4-hydrogen` is the default.
 
+[![Watch the demo](https://img.youtube.com/vi/7awFmSkwa2g/hqdefault.jpg)](https://youtu.be/7awFmSkwa2g)
+
 ## Install
 
 ```bash
