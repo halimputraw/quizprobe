@@ -10,6 +10,13 @@ Gemini model works; `gemini-4-hydrogen` is the default.
 
 https://github.com/user-attachments/assets/0ae77472-fe6a-4d5c-bbea-36d2ddd6e1e9
 
+## Requirements
+
+•⁠  ⁠Python 3.9 or newer
+•⁠  ⁠Jupyter Notebook or JupyterLab
+•⁠  ⁠A Google Gemini API key
+•⁠  ⁠Optional: ⁠ ipywidgets ⁠, for clickable answer button
+
 ## Install
 
 quizprobe is [on PyPI](https://pypi.org/project/quizprobe/):
@@ -140,8 +147,3 @@ quizprobe.answer(1, "B")
 `demo_quiz.ipynb` is a small example quiz with a deliberately wrong answer, so
 you can watch quizprobe work. Open it from this folder, set `GEMINI_API_KEY`,
 and run the cells in order.
-
-On Windows (PowerShell):
-
-⁠powershell
-setx GEMINI_API_KEY "your-key"
