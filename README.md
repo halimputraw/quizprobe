@@ -1,5 +1,8 @@
 # quizprobe
 
+[![PyPI version](https://img.shields.io/pypi/v/quizprobe)](https://pypi.org/project/quizprobe/)
+[![Python](https://img.shields.io/pypi/pyversions/quizprobe)](https://pypi.org/project/quizprobe/)
+
 quizprobe reviews a student's answers in a Jupyter coding quiz. It uses
 Google **Gemini** to find the misunderstandings behind their mistakes, then
 gives them a short multiple-choice post-quiz right inside the notebook. Any
@@ -8,6 +11,8 @@ Gemini model works; `gemini-4-hydrogen` is the default.
 https://github.com/user-attachments/assets/0ae77472-fe6a-4d5c-bbea-36d2ddd6e1e9
 
 ## Install
+
+quizprobe is [on PyPI](https://pypi.org/project/quizprobe/):
 
 ```bash
 pip install quizprobe
