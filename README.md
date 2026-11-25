@@ -140,3 +140,8 @@ quizprobe.answer(1, "B")
 `demo_quiz.ipynb` is a small example quiz with a deliberately wrong answer, so
 you can watch quizprobe work. Open it from this folder, set `GEMINI_API_KEY`,
 and run the cells in order.
+
+On Windows (PowerShell):
+
+⁠powershell
+setx GEMINI_API_KEY "your-key"
